@@ -1,94 +1,103 @@
+"""Webcam pushup form checker. Run `python main.py --help` for options; press q to quit."""
+import argparse
+import os
+import sys
+import time
+import urllib.request
+
 import cv2
 import mediapipe as mp
-import numpy as np
+from mediapipe.tasks.python import BaseOptions, vision
 
-# Initialize MediaPipe Pose
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
+from form_logic import MSG_NOT_VISIBLE, PushupCounter, side_points
 
-# Logic Variables
-counter = 0 
-stage = None # "up" or "down"
-feedback = "Get Ready!"
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+             "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task")
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pose_landmarker_lite.task")
 
-def calculate_angle(a, b, c):
-    a = np.array(a) # First (Shoulder)
-    b = np.array(b) # Mid (Elbow)
-    c = np.array(c) # End (Wrist)
-    
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    angle = np.abs(radians*180.0/np.pi)
-    
-    if angle > 180.0:
-        angle = 360-angle
-    return angle 
+WHITE = (255, 255, 255)
+RED = (0, 0, 255)
+ORANGE = (245, 117, 16)
 
-cap = cv2.VideoCapture(0)
 
-# Setup MediaPipe instance
-with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+def ensure_model(path):
+    if os.path.exists(path):
+        return
+    print(f"Downloading pose model to {path} ...")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".part"
+    urllib.request.urlretrieve(MODEL_URL, tmp_path)
+    os.replace(tmp_path, path)
 
-        # Recolor image to RGB
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image.flags.writeable = False
-      
-        # Make detection
-        results = pose.process(image)
-    
-        # Recolor back to BGR for rendering
-        image.flags.writeable = True
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        
-        try:
-            landmarks = results.pose_landmarks.landmark
-            
-            # Get coordinates for Elbow Angle
-            shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-            elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
-            wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
-            
-            # Get coordinates for Hip/Back Alignment
-            hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
-            knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
 
-            # Calculate angles
-            elbow_angle = calculate_angle(shoulder, elbow, wrist)
-            hip_angle = calculate_angle(shoulder, hip, knee)
+def create_landmarker(model_path):
+    options = vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=vision.RunningMode.VIDEO,
+        min_pose_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return vision.PoseLandmarker.create_from_options(options)
 
-            # Pushup Counter & Form Logic
-            # 1. Check for Hip Alignment (Plank form)
-            if hip_angle < 160:
-                feedback = "Keep your back straight!"
-            else:
-                feedback = "Form looks good!"
 
-                # 2. Pushup State Machine
-                if elbow_angle > 160:
-                    stage = "up"
-                if elbow_angle < 90 and stage =='up':
-                    stage = "down"
-                    counter += 1
-                    print(f"Rep Count: {counter}")
+def draw_overlay(frame, counter):
+    cv2.rectangle(frame, (0, 0), (250, 80), ORANGE, -1)
+    cv2.putText(frame, f"REPS: {counter.reps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, WHITE, 2)
+    cv2.putText(frame, f"STAGE: {counter.stage or '-'}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, WHITE, 2)
+    cv2.putText(frame, counter.feedback, (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, RED, 2)
 
-        except:
-            pass
 
-        # UI Overlay: Render Rep Counter and Feedback
-        cv2.rectangle(image, (0,0), (250, 80), (245, 117, 16), -1)
-        cv2.putText(image, f'REPS: {counter}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(image, f'STAGE: {stage}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(image, feedback, (300, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+def run(source, model_path):
+    ensure_model(model_path)
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"Error: could not open video source {source!r}", file=sys.stderr)
+        return 1
 
-        # Draw body landmarks on screen
-        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)               
-        
-        cv2.imshow('Pushup Form Checker', image)
+    counter = PushupCounter()
+    last_timestamp = -1
+    with create_landmarker(model_path) as landmarker:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            break
+            # VIDEO mode needs strictly increasing timestamps.
+            timestamp = max(int(time.monotonic() * 1000), last_timestamp + 1)
+            last_timestamp = timestamp
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp)
+
+            if result.pose_landmarks:
+                landmarks = result.pose_landmarks[0]
+                height, width = frame.shape[:2]
+                points = side_points(landmarks, width, height)
+                if points:
+                    counter.update_from_points(points)
+                else:
+                    counter.feedback = MSG_NOT_VISIBLE
+                vision.drawing_utils.draw_landmarks(
+                    frame, landmarks, vision.PoseLandmarksConnections.POSE_LANDMARKS)
+
+            draw_overlay(frame, counter)
+            cv2.imshow("Pushup Form Checker", frame)
+            if cv2.waitKey(10) & 0xFF == ord("q"):
+                break
 
     cap.release()
     cv2.destroyAllWindows()
+    print(f"Total reps: {counter.reps}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Count pushups and check your form with a webcam.")
+    parser.add_argument("--camera", type=int, default=0, help="webcam index (default: 0)")
+    parser.add_argument("--video", help="analyze a video file instead of the webcam")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="path to the pose landmarker .task model")
+    args = parser.parse_args(argv)
+    return run(args.video if args.video else args.camera, args.model)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
